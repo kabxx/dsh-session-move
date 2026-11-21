@@ -1,0 +1,7 @@
+- insert:
+    - id: session-move-recovery
+      name: '@kabxx/dsh-session-move/recovery'
+    - id: session-move
+      name: '@kabxx/dsh-session-move'
+- id: workspace
+  inject: [storageDomain, sessionPersistence, sessionMoveRecovery]

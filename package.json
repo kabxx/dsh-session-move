@@ -1,0 +1,47 @@
+{
+  "name": "@kabxx/dsh-session-move",
+  "version": "0.1.0",
+  "description": "Move sessions across workspaces by dragging them in the DeepSeek Harness sidebar.",
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kabxx/dsh-session-move.git"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./recovery": "./src/recovery.js",
+    "./client": "./src/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./recovery/locale/*.json": "./locale/recovery/*.json",
+    "./icon": "./icon.svg",
+    "./recovery/icon": "./icon.svg"
+  },
+  "files": [
+    "src/",
+    "cordis.patch.yml",
+    "locale/",
+    "icon.svg"
+  ],
+  "scripts": {
+    "check": "node -e \"for (const f of require('node:fs').readdirSync('src')) if (f.endsWith('.js')) require('node:child_process').execFileSync(process.execPath, ['--check', 'src/' + f], {stdio: 'inherit'})\"",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=24.9.0",
+    "dsh": "0.2.2-rc.5"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  }
+}

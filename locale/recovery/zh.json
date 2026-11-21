@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-session-move/recovery",
+    "description": "在启动时自动恢复或完成中断的会话移动事务。"
+  }
+}

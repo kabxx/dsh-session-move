@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Move session to another workspace">
+  <rect width="64" height="64" rx="14" fill="#101820"/>
+  <path d="M12 22a4 4 0 0 1 4-4h9.2l3.4 4.2H48a4 4 0 0 1 4 4v17.6a4 4 0 0 1-4 4H16a4 4 0 0 1-4-4Z"
+        fill="none" stroke="#4cc2ff" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M12 30.4h40" stroke="#4cc2ff" stroke-width="3" stroke-linecap="round" opacity="0.55"/>
+  <path d="M25 39.5h13" stroke="#7ee787" stroke-width="3" stroke-linecap="round"/>
+  <path d="M33.5 34.8 38.6 39.5l-5.1 4.7" fill="none" stroke="#7ee787" stroke-width="3"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

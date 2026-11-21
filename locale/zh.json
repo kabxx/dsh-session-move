@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-session-move",
+    "description": "在侧栏将会话拖至目标工作区文件夹，连同子智能体会话、日志目录与工作目录一并迁移。"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-session-move",
+    "description": "Drag a session onto another workspace folder in the sidebar to move it along with its subagent sessions, logs, and working directory."
+  }
+}

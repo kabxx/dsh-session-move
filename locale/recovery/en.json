@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-session-move/recovery",
+    "description": "Automatically recover or finish interrupted session move transactions on startup."
+  }
+}

@@ -1,6 +1,6 @@
 {
   "name": "@kabxx/dsh-session-move",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Move sessions across workspaces by dragging them in the DeepSeek Harness sidebar.",
   "type": "module",
   "publishConfig": {

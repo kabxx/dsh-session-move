@@ -1,10 +1,11 @@
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { storagePaths } from './config.js'
-import { refreshSearchIndex, repairLegacyDuplicates, restoreLedger, withPublishedLedger } from './ledger.js'
+import { repairLegacyDuplicates, restoreLedger, withPublishedLedger } from './ledger.js'
 import { refreshSessionSummaries } from './sidebar.js'
 import { LOG_FILENAME } from './paths.js'
 import { fail } from './plan.js'
+import { inspectMoveHistory } from './history.js'
 import { sessionRequire } from './platform-fs.js'
 import { moveStorage, recoverLegacyDisk } from './transaction.js'
 
@@ -36,22 +37,13 @@ async function hasPublishedHistory(ctx, storage, state) {
     if (error.code === 'changed') return false
     throw error
   }
-  for (const { id, oldCwd, cwdChangeSeq, noticeId } of state.members) {
+  const signal = AbortSignal.timeout(180_000)
+  for (const { id, oldCwd, nextDir, cwdChangeSeq, noticeId } of state.members) {
     if (oldCwd === state.targetCwd) continue
-    const handle = await ctx.sessionPersistence.open(id, 'read')
-    try {
-      if (handle.header.id !== id || handle.header.cwd !== state.targetCwd) return false
-      const { events } = await handle.read()
-      let directory
-      if (cwdChangeSeq !== undefined) {
-        directory = events.find(({ seq }) => seq === cwdChangeSeq)
-      } else if (typeof noticeId === 'string') {
-        // Older v2 journals identified the change by the following notice.
-        const noticeIndex = events.findIndex(({ type, data }) => type === 'user/message' && data?.id === noticeId)
-        if (noticeIndex > 0) directory = events[noticeIndex - 1]
-      }
-      if (directory?.type !== 'working-directory/change' || directory.data?.cwd !== state.targetCwd) return false
-    } finally { await handle.close() }
+    if (cwdChangeSeq === undefined && typeof noticeId !== 'string') return false
+    const result = await inspectMoveHistory({ path: join(nextDir, LOG_FILENAME), id,
+      cwd: state.targetCwd, cwdChangeSeq, noticeId }, { signal })
+    if (!result.proof) return false
   }
   return true
 }
@@ -70,7 +62,16 @@ async function verifyWhileContended(ctx, storage) {
 
 /** Retry a journal. Only startup may defer work after proving scan safety. */
 export async function recoverMove(ctx, storage, { startup = false, withLedger = (run) => run() } = {}) {
-  if (!await storage.hasJournal()) return
+  if (!await storage.hasJournal()) {
+    if (typeof storage.hasOrphans === 'function' && await storage.hasOrphans()) {
+      try {
+        await storage.withLock(() => storage.sweepOrphans())
+      } catch (error) {
+        ctx.logger?.warn?.('Session move: orphan cleanup deferred: %s', error)
+      }
+    }
+    return
+  }
   let scanSafe = false
   try {
     await storage.withLock(async () => {
@@ -98,8 +99,9 @@ export async function recoverMove(ctx, storage, { startup = false, withLedger = 
           }, { recovery: true })
           if (committed) {
             if (!startup) {
-              await refreshSessionSummaries(ctx, state.members.map(({ id }) => ({ id, cwd: state.targetCwd })))
-              await refreshSearchIndex(ctx)
+              await refreshSessionSummaries(ctx, state.members.map(({ id }) => ({ id, cwd: state.targetCwd })), undefined, {
+                signal: AbortSignal.timeout(180_000),
+              })
             }
             return
           }

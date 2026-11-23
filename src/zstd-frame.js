@@ -19,66 +19,102 @@ import { constants, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
 const ZSTD_MAGIC = 0xFD2FB528
 const CHECKSUM_OPTIONS = { params: { [constants.ZSTD_c_checksumFlag]: 1 } }
 
-/**
- * Locate complete frames without decompressing their blocks.
- * @param buffer - complete bytes currently present in the session artifact.
- * @returns complete frame ranges and an optional incomplete-final-frame start.
- */
-export function scanFrames(buffer) {
-  const frames = []
+const FRAME_MAGIC_BYTES = 4
+
+/** Scan compressed frame boundaries with fixed scratch space and no body decompression. */
+export function createFrameScanner() {
+  const scratch = Buffer.allocUnsafe(4)
+  let phase = 'magic'
+  let remaining = FRAME_MAGIC_BYTES
   let offset = 0
+  let start = 0
+  let checksum
+  let lastBlock
 
-  while (offset < buffer.length) {
-    const start = offset
-    if (buffer.length - offset < 4) return { frames, tornStart: start }
-    if (buffer.readUInt32LE(offset) !== ZSTD_MAGIC) {
-      throw new Error(`corrupt Zstandard session log: invalid frame magic at byte ${offset}`)
-    }
-    offset += 4
-
-    if (offset === buffer.length) return { frames, tornStart: start }
-    const descriptor = buffer.readUInt8(offset)
-    offset += 1
-    if ((descriptor & 0x18) !== 0) {
-      throw new Error(`corrupt Zstandard session log: reserved frame-header bit at byte ${offset - 1}`)
-    }
-
-    const contentSizeFlag = descriptor >>> 6
-    const singleSegment = (descriptor & 0x20) !== 0
-    const checksum = (descriptor & 0x04) !== 0
-    const dictionaryFlag = descriptor & 0x03
-    const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag
-    const contentSizeBytes = contentSizeFlag === 0
-      ? (singleSegment ? 1 : 0)
-      : 1 << contentSizeFlag
-    const remainingHeaderBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes
-    if (buffer.length - offset < remainingHeaderBytes) return { frames, tornStart: start }
-    offset += remainingHeaderBytes
-
-    for (;;) {
-      if (buffer.length - offset < 3) return { frames, tornStart: start }
-      const blockHeader = buffer.readUIntLE(offset, 3)
-      offset += 3
-      const lastBlock = (blockHeader & 1) !== 0
-      const blockType = (blockHeader >>> 1) & 0x03
-      const blockSize = blockHeader >>> 3
-      if (blockType === 0x03) {
-        throw new Error(`corrupt Zstandard session log: reserved block type at byte ${offset - 3}`)
-      }
-      const payloadBytes = blockType === 0x01 ? 1 : blockSize
-      if (buffer.length - offset < payloadBytes) return { frames, tornStart: start }
-      offset += payloadBytes
-      if (lastBlock) break
-    }
-
-    if (checksum) {
-      if (buffer.length - offset < 4) return { frames, tornStart: start }
-      offset += 4
-    }
-    frames.push({ start, end: offset })
+  function nextPhase(name, bytes) {
+    phase = name
+    remaining = bytes
   }
 
-  return { frames }
+  function completeFrame(onFrame) {
+    const end = offset
+    nextPhase('magic', FRAME_MAGIC_BYTES)
+    onFrame?.({ start, end })
+    start = end
+  }
+
+  function advance(onFrame) {
+    switch (phase) {
+      case 'magic':
+        if (scratch.readUInt32LE(0) !== ZSTD_MAGIC) {
+          throw new Error(`corrupt Zstandard session log: invalid frame magic at byte ${start}`)
+        }
+        nextPhase('descriptor', 1)
+        break
+      case 'descriptor': {
+        const descriptor = scratch[0]
+        if ((descriptor & 0x18) !== 0) {
+          throw new Error(`corrupt Zstandard session log: reserved frame-header bit at byte ${offset - 1}`)
+        }
+        const contentSizeFlag = descriptor >>> 6
+        const singleSegment = (descriptor & 0x20) !== 0
+        checksum = (descriptor & 0x04) !== 0
+        const dictionaryFlag = descriptor & 0x03
+        const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag
+        const contentSizeBytes = contentSizeFlag === 0 ? (singleSegment ? 1 : 0) : 1 << contentSizeFlag
+        nextPhase('frame-header', (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes)
+        break
+      }
+      case 'frame-header':
+        nextPhase('block-header', 3)
+        break
+      case 'block-header': {
+        const blockHeader = scratch.readUIntLE(0, 3)
+        lastBlock = (blockHeader & 1) !== 0
+        const blockType = (blockHeader >>> 1) & 0x03
+        if (blockType === 0x03) {
+          throw new Error(`corrupt Zstandard session log: reserved block type at byte ${offset - 3}`)
+        }
+        nextPhase('block', blockType === 0x01 ? 1 : blockHeader >>> 3)
+        break
+      }
+      case 'block':
+        if (!lastBlock) nextPhase('block-header', 3)
+        else if (checksum) nextPhase('checksum', 4)
+        else completeFrame(onFrame)
+        break
+      case 'checksum':
+        completeFrame(onFrame)
+    }
+  }
+
+  return {
+    write(chunk, onFrame) {
+      let cursor = 0
+      while (cursor < chunk.length) {
+        const count = Math.min(remaining, chunk.length - cursor)
+        // Only descriptor and block metadata need to survive a chunk boundary.
+        if (phase === 'magic' || phase === 'descriptor' || phase === 'block-header') {
+          const fieldWidth = phase === 'magic' ? FRAME_MAGIC_BYTES : phase === 'descriptor' ? 1 : 3
+          chunk.copy(scratch, fieldWidth - remaining, cursor, cursor + count)
+        }
+        cursor += count
+        offset += count
+        remaining -= count
+        while (remaining === 0) advance(onFrame)
+      }
+    },
+    finish() { return offset === start ? undefined : start },
+  }
+}
+
+/** Locate complete frames in an in-memory artifact. */
+export function scanFrames(buffer) {
+  const frames = []
+  const scanner = createFrameScanner()
+  scanner.write(buffer, (frame) => frames.push(frame))
+  const tornStart = scanner.finish()
+  return tornStart === undefined ? { frames } : { frames, tornStart }
 }
 
 /**

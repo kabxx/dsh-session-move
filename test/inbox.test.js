@@ -3,7 +3,18 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import test from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { assertNoPendingInbox } from '../src/inbox.js'
+import { fail, moveScope } from '../src/plan.js'
+
+// Independent native replay oracle for the streaming worker regressions.
+function assertNoPendingInbox(ctx, header, events, inheritedEventCount) {
+  let values
+  try {
+    if (!Number.isSafeInteger(inheritedEventCount) || inheritedEventCount < 0 || inheritedEventCount > events.length) throw new Error('Invalid cut')
+    values = ctx.sessionProjections.restore({}, events, 0, header, inheritedEventCount).snapshot.values.inbox
+    if (!Array.isArray(values?.['next-turn']) || !Array.isArray(values['next-step'])) throw new Error('Invalid inbox')
+  } catch (error) { throw fail('unsupported', error) }
+  if (values['next-turn'].length || values['next-step'].length) throw fail('busy')
+}
 
 const header = { version: 4, id: 'session-inbox-test', createdAt: 1, isSeeded: false }
 const emptyInbox = () => ({ 'next-turn': [], 'next-step': [] })
@@ -38,6 +49,15 @@ test('unavailable replay and missing or malformed inbox projections refuse admis
 })
 
 const install = process.env.DSH_INSTALL_DIR
+
+test('new moves admit at most 128 members including the parent', () => {
+  const root = 'test-root'
+  const stored = [{ header: { id: root } }, ...Array.from({ length: 128 }, (_, index) => ({
+    header: { id: `child-${index}`, origin: 'subagent', parentSession: root },
+  }))]
+  assert.equal(moveScope(root, stored.slice(0, 128), []).length, 128)
+  assert.throws(() => moveScope(root, stored, []), { code: 'family-limit' })
+})
 
 test('DSH cold replay refuses either pending queue and accepts a queue cleared in history', {
   skip: !install && 'Set DSH_INSTALL_DIR to the pinned DSH installation',

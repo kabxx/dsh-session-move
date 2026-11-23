@@ -13,13 +13,20 @@ const source = await readFile(new URL('../src/client.js', import.meta.url), 'utf
 // Flat row markers and their DOM ancestry are the only DOM contract used by
 // the plugin. No browser, live sessions, or GUI changes are needed here.
 class RowElement {
-  constructor({ parent = null, key = null, draggable = false, expanded = null } = {}) {
+  constructor({ parent = null, key = null, draggable = false, expanded = null, role = null, listArea = false } = {}) {
     this.parent = parent
+    this.children = []
     this.isConnected = true
     this.dispatched = []
     this.draggable = draggable
-    this.attributes = { 'data-row-key': key, 'aria-expanded': expanded }
+    this.attributes = {
+      'data-row-key': key,
+      'aria-expanded': expanded,
+      role,
+      'data-sidebar-list-area': listArea ? '' : null,
+    }
     this.style = { outline: '', outlineOffset: '' }
+    if (parent !== null) parent.children.push(this)
   }
 
   dispatchEvent(event) {
@@ -30,10 +37,26 @@ class RowElement {
     return this.attributes[name] ?? null
   }
 
+  matches(selector) {
+    if (selector === '[data-row-key]') return this.getAttribute('data-row-key') !== null
+    if (selector === '[data-row-key^="workspace:"]') return this.getAttribute('data-row-key')?.startsWith('workspace:') === true
+    if (selector === '[data-sidebar-list-area]') return this.getAttribute('data-sidebar-list-area') !== null
+    if (selector === '[role="tree"]') return this.getAttribute('role') === 'tree'
+    throw new Error(`Unsupported selector in test DOM: ${selector}`)
+  }
+
   closest(selector) {
-    assert.equal(selector, '[data-row-key]')
     for (let node = this; node !== null; node = node.parent) {
-      if (node.getAttribute('data-row-key') !== null) return node
+      if (node.matches(selector)) return node
+    }
+    return null
+  }
+
+  querySelector(selector) {
+    for (const child of this.children) {
+      if (child.matches(selector)) return child
+      const nested = child.querySelector(selector)
+      if (nested !== null) return nested
     }
     return null
   }
@@ -50,10 +73,12 @@ class RowElement {
   }
 }
 
-function fixture(t, language = 'zh', liveFetch = null) {
+function fixture(t, language = 'zh', liveFetch = null, { sessions = null } = {}) {
   const effects = []
   const listeners = new Map()
   const requests = []
+  const toastErrors = []
+  let toastError = null
   let fetchResult = { moved: true }
   let status = 200
   let pendingRequest
@@ -80,10 +105,25 @@ function fixture(t, language = 'zh', liveFetch = null) {
     },
   }
   const modules = {
-    react: { useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot() },
+    react: {
+      Fragment: Symbol('Fragment'),
+      createElement: (type, props, ...children) => ({ type, props, children }),
+      useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
+    },
     '@deepseek-ai/dsh-client-store': { createSnapshotStore(initial) {
       let value = initial
-      return { getSnapshot: () => value, subscribe: () => {}, set: (next) => { value = next } }
+      return {
+        getSnapshot: () => value,
+        subscribe: () => {},
+        set(next) {
+          if (toastError !== null) {
+            const error = toastError
+            toastError = null
+            throw error
+          }
+          value = next
+        },
+      }
     } },
   }
   let translate
@@ -98,9 +138,20 @@ function fixture(t, language = 'zh', liveFetch = null) {
       register: (_options, render) => { slot = render },
     },
     effect: (create) => { effects.push(create()) },
+    ...(sessions === null ? {} : {
+      inject(services, callback) {
+        if (!services.includes('sessions')) return
+        const scoped = {
+          get: (name) => name === 'sessions' ? sessions : undefined,
+          effect: (create) => { effects.push(create()) },
+        }
+        callback(scoped)
+      },
+    }),
   }
   runInNewContext(source, {
     AbortController,
+    console: { warn: (_message, error) => toastErrors.push(error) },
     document,
     Element: RowElement,
     Node: RowElement,
@@ -126,15 +177,17 @@ function fixture(t, language = 'zh', liveFetch = null) {
   const dispose = () => { for (const effect of effects.splice(0).reverse()) effect?.() }
   t.after(dispose)
 
-  const root = new RowElement()
+  const root = new RowElement({ listArea: true, role: 'tree' })
   const folder = (workspaceId, parent = root, expanded = true) =>
     parent.child({ key: `workspace:${workspaceId}`, expanded: String(expanded) })
   const session = (id, parent = root, draggable = true) =>
     parent.child({ key: `session:${id}`, draggable })
   const bGroup = root.child()
   const b1Group = bGroup.child()
+  const renderFeedback = () => slot({ t: translate, renderFactorySlot: (_name, props) => props })
   return {
-    snapshot, requests, dispose, listeners,
+    snapshot, requests, dispose, listeners, toastErrors,
+    failNextToast(error) { toastError = error },
     rows: {
       a: folder('A'), b: folder('B', bGroup), b1: folder('B1', b1Group),
       empty: folder('empty', root, false), ungrouped: folder(''), unknown: folder('unknown'),
@@ -158,7 +211,11 @@ function fixture(t, language = 'zh', liveFetch = null) {
     },
     setResponse(code, result) { status = code; fetchResult = result },
     completedRequest: () => pendingRequest,
-    toast: () => slot({ t: translate, renderFactorySlot: (_name, props) => props }),
+    toast: () => renderFeedback().children[1],
+    progress: () => {
+      const [status] = renderFeedback().children
+      return { status, indicator: status.children[0] }
+    },
   }
 }
 
@@ -347,6 +404,7 @@ test('an ungrouped source stays null if the session joins a workspace during dra
   f.snapshot.items[0].sessionIds.push('loose')
   assert.equal(f.dispatch('drop', f.rows.b).defaultPrevented, true)
   assert.deepEqual(f.requests, [postTo('loose', 'B', null)])
+  assert.equal(f.progress().indicator.children[2], 'Moving session…')
   await setImmediate()
   assert.equal(f.toast().text, 'The session’s workspace has changed. Drag it again from its new location.')
   assert.equal(f.toast().tone, 'warning')
@@ -368,7 +426,7 @@ test('dragend and plugin unload clear feedback and unload removes listeners', (t
   assert.equal(f.listeners.size, 0)
 })
 
-test('dragging to either of two same-titled workspaces uses the folder row ID', (t) => {
+test('dragging to either of two same-titled workspaces uses the folder row ID', async (t) => {
   const f = fixture(t)
   const { source, b, b1 } = f.rows
   f.snapshot.items[1].title = 'api'
@@ -376,13 +434,144 @@ test('dragging to either of two same-titled workspaces uses the folder row ID', 
   for (const target of [b, b1]) {
     f.dispatch('dragstart', source)
     assert.equal(f.dispatch('drop', target).defaultPrevented, true)
+    await setImmediate()
   }
   assert.deepEqual(f.requests, [postTo('sA', 'B', 'A'), postTo('sA', 'B1', 'A')])
+})
+
+test('a cross-workspace drop reports progress once, blocks repeats, and replaces progress with the result', async (t) => {
+  const deferred = Promise.withResolvers()
+  const f = fixture(t, 'zh', () => deferred.promise)
+  const { source, a, b, b1, sameGroup } = f.rows
+  f.dispatch('dragstart', source)
+  f.dispatch('dragover', b)
+  f.dispatch('dragend', source)
+  assert.equal(f.progress().indicator, null)
+  assert.equal(f.toast(), null)
+  assert.deepEqual(f.requests, [])
+
+  f.dispatch('dragstart', source)
+  f.dispatch('dragover', b)
+  f.dispatch('drop', b)
+  const { status, indicator } = f.progress()
+  assert.equal(status.props.role, 'status')
+  assert.equal(status.props.style.pointerEvents, 'none')
+  const [style, spinnerElement, text] = indicator.children
+  assert.equal(text, '正在移动会话…')
+  const spinner = spinnerElement.type(spinnerElement.props)
+  assert.equal(spinner.type, 'svg')
+  assert.equal(spinner.props['aria-hidden'], true)
+  assert.equal(spinner.props.viewBox, '0 0 24 24')
+  assert.equal(spinner.props.width, 18)
+  assert.equal(spinner.props.height, 18)
+  assert.match(style.children[0], /\.kabxx-session-move-spinner\s*\{[^}]*color: var\(--dsw-alias-toast-action\)/)
+  assert.deepEqual(Array.from(spinner.children[0].children, ({ type, props }) => [type, props.r]), [
+    ['circle', 9.5], ['circle', 9.5],
+  ])
+  assert.match(style.children[0], /kabxx-session-move-dash 1\.5s ease-in-out infinite/)
+  assert.match(style.children[0], /prefers-reduced-motion: reduce/)
+
+  f.dispatch('dragstart', source)
+  assert.equal(f.dispatch('dragover', sameGroup).dataTransfer.dropEffect, 'move')
+  assert.equal(f.dispatch('dragover', b1).dataTransfer.dropEffect, 'none')
+  assert.equal(b1.style.outline, '')
+  f.dispatch('drop', b1)
+  f.dispatch('dragend', source)
+  assert.deepEqual(f.requests, [postTo('sA', 'B', 'A')])
+  assert.equal(f.progress().indicator.children[2], '正在移动会话…')
+  assert.equal(f.toast(), null)
+
+  deferred.resolve(Response.json({ moved: true }))
+  await setImmediate()
+  const completed = f.toast()
+  assert.equal(completed.tone, 'success')
+  assert.equal(f.progress().indicator, null)
+  completed.onDone()
+  assert.equal(f.toast(), null)
+
+  f.snapshot.items[0].sessionIds = ['sA2']
+  f.snapshot.items[1].sessionIds.push('sA')
+  f.dispatch('dragstart', source)
+  f.dispatch('drop', a)
+  assert.deepEqual(f.requests, [postTo('sA', 'B', 'A'), postTo('sA', 'A', 'B')])
+})
+
+test('progress returns while another session is pending and clears on unload', async (t) => {
+  const first = Promise.withResolvers()
+  const second = Promise.withResolvers()
+  let secondSignal
+  const f = fixture(t, 'en', (request) => {
+    if (f.requests.length === 1) return first.promise
+    secondSignal = request.signal
+    return second.promise
+  })
+  const { source, sameGroup, b } = f.rows
+  f.dispatch('dragstart', source)
+  f.dispatch('drop', b)
+  f.dispatch('dragstart', sameGroup)
+  f.dispatch('drop', b)
+  assert.deepEqual(f.requests, [postTo('sA', 'B', 'A'), postTo('sA2', 'B', 'A')])
+
+  first.reject(new Error('offline'))
+  await setImmediate()
+  const failure = f.toast()
+  assert.equal(failure.text, 'Failed to move the session. Try again.')
+  failure.onDone()
+  assert.equal(f.progress().indicator.children[2], 'Moving session…')
+
+  f.dispose()
+  assert.equal(secondSignal.aborted, true)
+  assert.equal(f.progress().indicator, null)
+  assert.equal(f.toast(), null)
+  second.resolve(Response.json({ moved: true }))
+  await setImmediate()
+  assert.equal(f.toast(), null)
+})
+
+test('concurrent results replace progress and are shown in order', async (t) => {
+  const first = Promise.withResolvers()
+  const second = Promise.withResolvers()
+  const f = fixture(t, 'en', () => f.requests.length === 1 ? first.promise : second.promise)
+  const { source, sameGroup, b, b1 } = f.rows
+  f.dispatch('dragstart', source)
+  f.dispatch('drop', b)
+  assert.equal(f.progress().indicator.children[2], 'Moving session…')
+  assert.equal(f.toast(), null)
+
+  f.dispatch('dragstart', sameGroup)
+  f.dispatch('drop', b1)
+  first.reject(new Error('offline'))
+  await setImmediate()
+  const failure = f.toast()
+  assert.equal(failure.tone, 'warning')
+  second.resolve(Response.json({ moved: true }))
+  await setImmediate()
+  assert.equal(f.toast().seq, failure.seq)
+  failure.onDone()
+  const success = f.toast()
+  assert.equal(success.tone, 'success')
+  failure.onDone()
+  assert.equal(f.toast().seq, success.seq)
+  success.onDone()
+  assert.equal(f.toast(), null)
+})
+
+test('an unavailable progress notification does not prevent the requested move', async (t) => {
+  const f = fixture(t)
+  const failure = new Error('notification subscriber failed')
+  f.failNextToast(failure)
+  f.dispatch('dragstart', f.rows.source)
+  f.dispatch('drop', f.rows.b)
+  assert.deepEqual(f.requests, [postTo('sA', 'B', 'A')])
+  assert.deepEqual(f.toastErrors, [failure])
+  await setImmediate()
+  assert.equal(f.toast().tone, 'success')
 })
 
 test('drag feedback requires explicit host success and reports pending cleanup', async (t) => {
   const f = fixture(t)
   const drop = async (status, result) => {
+    f.toast()?.onDone()
     f.setResponse(status, result)
     f.dispatch('dragstart', f.rows.source)
     f.dispatch('drop', f.rows.b)
@@ -408,4 +597,251 @@ test('drag feedback requires explicit host success and reports pending cleanup',
   await drop(200, { moved: true })
   assert.equal(f.toast().tone, 'success')
   assert.deepEqual(f.requests, Array.from({ length: 5 }, () => postTo('sA', 'B', 'A')))
+})
+
+test('flat single-list sorting keeps native drag cursor and skips move interception', (t) => {
+  const f = fixture(t)
+  for (const containerOptions of [{ listArea: true, role: 'tree' }, { role: 'tree' }]) {
+    const flatRoot = new RowElement(containerOptions)
+    const flatA = flatRoot.child({ key: 'session:sA', draggable: true })
+    const flatB = flatRoot.child({ key: 'session:sB', draggable: true })
+
+    f.dispatch('dragstart', flatA)
+    const overB = f.dispatch('dragover', flatB.child())
+    assert.equal(overB.defaultPrevented, false)
+    assert.equal(overB.stopped, false)
+    assert.equal(overB.dataTransfer.dropEffect, 'move')
+    const dropB = f.dispatch('drop', flatB.child())
+    assert.equal(dropB.defaultPrevented, false)
+    assert.equal(dropB.stopped, false)
+    f.dispatch('dragend', flatA)
+    assert.deepEqual(flatA.dispatched, [])
+  }
+  assert.deepEqual(f.requests, [])
+})
+
+function mockProjectionStore(initial = {}) {
+  const rows = new Map(Object.entries(initial).map(([key, value]) => [key, { kind: 'sequenced', value }]))
+  return {
+    rows,
+    clears: 0,
+    clear() {
+      this.clears++
+      rows.clear()
+    },
+    applyCached(values) {
+      for (const [key, value] of Object.entries(values)) {
+        if (rows.get(key)?.kind === 'sequenced') continue
+        rows.set(key, { kind: 'cached', value })
+      }
+    },
+    seed(values) {
+      for (const [key, row] of rows) if (row.kind === 'cached') rows.delete(key)
+      for (const [key, value] of Object.entries(values)) rows.set(key, { kind: 'sequenced', value })
+    },
+    values: () => Object.fromEntries([...rows].map(([key, row]) => [key, row.value])),
+  }
+}
+
+function mockSessionsFixture() {
+  const bindings = new Map()
+  const sessions = new Map()
+  const rebinds = []
+  const manager = {
+    summaries: [],
+    projectionStores: new Map(),
+    projectionInflight: new Map(),
+    projectionLoads: new Map(),
+    handleSessionRemoved(id) {
+      this.summaries = this.summaries.filter((item) => item.sessionId !== id)
+      sessions.get(id)?.handleRemoved()
+      this.projectionStores.delete(id)
+      this.projectionInflight.get(id)?.controller?.abort?.()
+      this.projectionInflight.delete(id)
+      this.projectionLoads.delete(id)
+    },
+    handleSessionAdded(summary) {
+      const id = summary.sessionId
+      const existing = this.summaries.findIndex((item) => item.sessionId === id)
+      if (existing >= 0) this.summaries[existing] = summary
+      else this.summaries.push(summary)
+      let store = this.projectionStores.get(id)
+      if (!store) {
+        store = mockProjectionStore()
+        this.projectionStores.set(id, store)
+      }
+      if (summary.projections?.kind === 'cached') store.applyCached(summary.projections.values)
+      else if (summary.projections?.kind === 'sequenced') store.seed(summary.projections.values)
+    },
+  }
+  const originalRemove = manager.handleSessionRemoved
+  const originalAdd = manager.handleSessionAdded
+  const runtime = {
+    manager,
+    binding: (id) => bindings.get(id),
+  }
+  function mountSession(id, { openState = 'open', cwd = '/A', title = 'Original', attachmentIds = [], subagent = null, onResync } = {}) {
+    const projections = mockProjectionStore({ title, workingDirectory: cwd })
+    const session = {
+      sessionId: id,
+      openState,
+      removed: false,
+      subagent,
+      projections,
+      dirtyCount: 0,
+      resyncCount: 0,
+      notifier: { markDirty() { session.dirtyCount++ } },
+      getSnapshot() { return { openState: this.openState, removed: this.removed, subagent: this.subagent } },
+      handleRemoved() { this.removed = true; this.dirtyCount++ },
+      async resync() {
+        this.resyncCount++
+        if (onResync) await onResync(this)
+        else {
+          this.openState = 'open'
+          this.projections.seed({ title, workingDirectory: manager.summaries.find((item) => item.sessionId === id)?.cwd ?? cwd })
+        }
+      },
+    }
+    const conversation = {
+      input: { for: () => ({ state: { getSnapshot: () => ({ attachmentIds }) } }) },
+      rebindDraftFiles: (...args) => { rebinds.push(args) },
+    }
+    const binding = {
+      sessionId: id,
+      session,
+      ctx: { get: (name) => name === 'conversation' ? conversation : undefined },
+    }
+    sessions.set(id, session)
+    bindings.set(id, binding)
+    manager.projectionStores.set(id, projections)
+    manager.summaries.push({ sessionId: id, cwd, agentAvailable: true })
+    return { session, binding }
+  }
+  return { runtime, manager, bindings, rebinds, mountSession, originalRemove, originalAdd }
+}
+
+test('moving or rolling back an open viewed session recovers input, rejoins projections, and deduplicates promotion', async (t) => {
+  const s = mockSessionsFixture()
+  const resyncGate = Promise.withResolvers()
+  const { session } = s.mountSession('sA', {
+    cwd: '/A',
+    title: 'Active Chat',
+    attachmentIds: ['draft-1'],
+    async onResync(target) {
+      target.openState = 'loading'
+      await resyncGate.promise
+      target.openState = 'open'
+      target.projections.seed({ title: 'Active Chat', workingDirectory: '/B' })
+    },
+  })
+  const f = fixture(t, 'zh', null, { sessions: s.runtime })
+
+  s.manager.handleSessionRemoved('sA')
+  assert.equal(session.removed, true)
+  assert.equal(s.manager.projectionStores.has('sA'), false)
+
+  // Cold re-addition emitted by move (or rollback) rejoins the store immediately
+  // and starts one resync without losing the cached title while loading.
+  s.manager.handleSessionAdded({
+    sessionId: 'sA',
+    cwd: '/B',
+    agentAvailable: false,
+    projections: { kind: 'cached', values: { title: 'Active Chat', workingDirectory: '/B' } },
+  })
+  assert.equal(s.manager.projectionStores.get('sA'), session.projections)
+  assert.deepEqual(session.projections.values(), { title: 'Active Chat', workingDirectory: '/B' })
+  assert.equal(session.removed, true)
+
+  // Follow activation can emit a live addition while resync is still pending;
+  // it must neither clear projections again nor trigger a duplicate resync.
+  const clearsBeforePromotion = session.projections.clears
+  s.manager.handleSessionAdded({
+    sessionId: 'sA',
+    cwd: '/B',
+    agentAvailable: true,
+    projections: { kind: 'sequenced', values: { title: 'Active Chat', workingDirectory: '/B' } },
+  })
+  assert.equal(session.projections.clears, clearsBeforePromotion)
+
+  await setImmediate()
+  assert.equal(session.resyncCount, 1)
+  assert.deepEqual(s.rebinds, [['sA', ['draft-1'], true]])
+
+  const dirtyBefore = session.dirtyCount
+  resyncGate.resolve()
+  await setImmediate()
+  assert.equal(session.removed, false)
+  assert.ok(session.dirtyCount > dirtyBefore)
+  assert.deepEqual(session.projections.values(), { title: 'Active Chat', workingDirectory: '/B' })
+
+  // Disposing the plugin restores the manager's original handlers.
+  f.dispose()
+  assert.equal(s.manager.handleSessionRemoved, s.originalRemove)
+  assert.equal(s.manager.handleSessionAdded, s.originalAdd)
+})
+
+test('permanent deletion, mid-resync removal, and failed resync keep a viewed session removed until a valid retry', async (t) => {
+  const s = mockSessionsFixture()
+  let mode = 'error'
+  let gate = null
+  const { session } = s.mountSession('sA', {
+    async onResync(target) {
+      if (gate) await gate.promise
+      target.openState = mode === 'ok' ? 'open' : 'error'
+    },
+  })
+  fixture(t, 'zh', null, { sessions: s.runtime })
+
+  // Real deletion never receives api-session/added.
+  s.manager.handleSessionRemoved('sA')
+  assert.equal(session.removed, true)
+
+  // Failed resync keeps the session removed.
+  s.manager.handleSessionAdded({ sessionId: 'sA', cwd: '/A', agentAvailable: false })
+  await setImmediate()
+  assert.equal(session.resyncCount, 1)
+  assert.equal(session.removed, true)
+
+  // A subsequent removal while resync is in flight invalidates that sync even if it resolves open.
+  mode = 'ok'
+  gate = Promise.withResolvers()
+  s.manager.handleSessionAdded({ sessionId: 'sA', cwd: '/A', agentAvailable: false })
+  await setImmediate()
+  assert.equal(session.resyncCount, 2)
+  s.manager.handleSessionRemoved('sA')
+  gate.resolve()
+  await setImmediate()
+  assert.equal(session.removed, true)
+
+  // A later valid addition recovers cleanly.
+  gate = null
+  s.manager.handleSessionAdded({ sessionId: 'sA', cwd: '/B', agentAvailable: false })
+  await setImmediate()
+  assert.equal(session.resyncCount, 3)
+  assert.equal(session.removed, false)
+})
+
+test('cold retained sessions clear removed directly and open non-removed sessions resync on cwd change', async (t) => {
+  const s = mockSessionsFixture()
+  const { session: cold } = s.mountSession('sCold', { openState: 'cold', cwd: '/A' })
+  const { session: openSub } = s.mountSession('sSub', { openState: 'open', cwd: '/A', subagent: { parentSessionId: 'sA' } })
+  fixture(t, 'zh', null, { sessions: s.runtime })
+
+  s.manager.handleSessionRemoved('sCold')
+  assert.equal(cold.removed, true)
+  s.manager.handleSessionAdded({
+    sessionId: 'sCold',
+    cwd: '/B',
+    agentAvailable: false,
+    projections: { kind: 'cached', values: { title: 'Original', workingDirectory: '/B' } },
+  })
+  assert.equal(cold.removed, false)
+  assert.equal(cold.resyncCount, 0)
+  assert.deepEqual(cold.projections.values(), { title: 'Original', workingDirectory: '/B' })
+
+  s.manager.handleSessionAdded({ sessionId: 'sSub', cwd: '/B', agentAvailable: false })
+  await setImmediate()
+  assert.equal(openSub.resyncCount, 1)
+  assert.equal(openSub.removed, false)
+  assert.deepEqual(openSub.projections.values(), { title: 'Original', workingDirectory: '/B' })
 })

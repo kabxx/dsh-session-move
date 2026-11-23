@@ -27,6 +27,12 @@ export function fail(code, cause) {
   return Object.assign(new Error(`Session move (${code})`), { code, cause })
 }
 
+function checkPreparing(signal) {
+  if (signal?.aborted) {
+    throw fail(signal.reason?.name === 'TimeoutError' ? 'history-timeout' : 'history-cancelled', signal.reason)
+  }
+}
+
 /**
  * Expand a session into itself plus every subagent session created from it.
  * Children move with their parent so the delegation tree never spans two
@@ -53,6 +59,7 @@ export function moveScope(root, stored, live) {
   const visit = (id) => {
     if (seen.has(id)) return
     seen.add(id)
+    if (ordered.length === 128) throw fail('family-limit')
     ordered.push(id)
     for (const child of children.get(id) ?? []) visit(child)
   }
@@ -79,7 +86,8 @@ export function assertExpectedSource(workspaces, request) {
  * `targetWorkspaceId`, optional `beforeSessionId`.
  * @returns the plan, ready to execute.
  */
-export async function buildPlan(ctx, { root }, request) {
+export async function buildPlan(ctx, { root }, request, { signal } = {}) {
+  checkPreparing(signal)
   const registry = ctx.workspaceRegistry
   const workspaces = registry.list()
   const sourceWorkspaceId = assertExpectedSource(workspaces, request)
@@ -96,6 +104,7 @@ export async function buildPlan(ctx, { root }, request) {
   } catch {
     targetIsDirectory = false
   }
+  checkPreparing(signal)
   if (!targetIsDirectory) throw fail('target-missing')
 
   // The attach validation compares the header's realpath against the stored
@@ -103,13 +112,21 @@ export async function buildPlan(ctx, { root }, request) {
   // path this plugin composed itself.
   const targetCwd = targetPath
 
-  const stored = await ctx.sessionPersistence.list()
+  let stored
+  try {
+    stored = await ctx.sessionPersistence.list(signal ? { signal } : undefined)
+  } catch (error) {
+    checkPreparing(signal)
+    throw error
+  }
+  checkPreparing(signal)
   const members = moveScope(request.sessionId, stored, ctx.sessions.list())
   if (registry.archivedSessionIds?.includes(request.sessionId)) throw fail('archived')
   const snapshots = new Map(stored.map((snapshot) => [snapshot.header.id, snapshot]))
 
   const planned = []
   for (const id of members) {
+    checkPreparing(signal)
     const snapshot = snapshots.get(id)
     if (snapshot === undefined) throw fail('missing')
     const oldCwd = snapshot.header.cwd
@@ -127,6 +144,7 @@ export async function buildPlan(ctx, { root }, request) {
   // A destination that already holds this session's directory means the move
   // would merge two transcripts. Refuse rather than guess which one wins.
   for (const member of planned) {
+    checkPreparing(signal)
     if (member.oldDir === member.nextDir) continue
     try {
       await lstat(member.nextDir)
@@ -139,12 +157,14 @@ export async function buildPlan(ctx, { root }, request) {
   // `attachSession` re-reads the header and canonicalizes it; a target whose
   // realpath differs from its record path could never be attached, so refuse
   // now instead of after the files moved.
+  checkPreparing(signal)
   let canonicalTarget
   try {
     canonicalTarget = await realpath(targetPath)
   } catch {
     throw fail('target-missing')
   }
+  checkPreparing(signal)
   if (canonicalTarget !== targetPath) {
     // Canonicalizing would change the string attach compares against, so the
     // only safe outcome is refusing while nothing has moved.

@@ -301,23 +301,3 @@ export async function repairLegacyDuplicates(ctx, options) {
   })
   return repaired
 }
-
-/** Reconcile the search index if the deployment has opened it. */
-export async function refreshSearchIndex(ctx) {
-  try {
-    const query = ctx.get('sessionQuery')
-    if (query?.config?.openAt === 'never' || typeof query?.searchSessions !== 'function') return
-    const { openAt, path } = query.config ?? {}
-    if (openAt === 'first-search' && typeof path === 'string' && path !== ':memory:') {
-      try {
-        await stat(path)
-      } catch (error) {
-        if (error.code === 'ENOENT') return
-        throw error
-      }
-    }
-    await query.searchSessions({ query: 'session', limit: 1 })
-  } catch (error) {
-    ctx.logger?.warn?.('Session move: search reconciliation failed: %s', error)
-  }
-}

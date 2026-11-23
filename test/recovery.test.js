@@ -272,3 +272,23 @@ for (const failure of ['missing-marker', 'legacy-missing-marker', 'missing-ledge
     assert.deepEqual(await response.json(), completes ? { moved: true } : { error: 'restore-pending' })
   })
 }
+
+test('startup recovery sweeps orphaned backup tickets left without a journal', {
+  skip: process.platform !== 'linux' && !process.env.DSH_INSTALL_DIR && 'Set DSH_INSTALL_DIR to the pinned DSH installation',
+}, async (t) => {
+  const home = await realpath(await mkdtemp(join(tmpdir(), 'dsh-move-orphan-sweep-')))
+  t.after(() => rm(home, { force: true, recursive: true }))
+  const root = join(home, 'sessions')
+  const base = join(home, 'plugin')
+  const ticket = '12345678-1234-1234-1234-1234567890ab'
+  const orphan = join(base, 'backups', ticket, 'original')
+  await mkdir(root, { recursive: true })
+  await mkdir(orphan, { recursive: true })
+  await writeFile(join(orphan, 'leftover.bin'), 'orphan-bytes')
+
+  const storage = moveStorage(root, base)
+  assert.equal(await storage.hasJournal(), false)
+  assert.equal(await storage.hasOrphans(), true)
+  await recoverMove({ logger: { warn() {} } }, storage, { startup: true })
+  assert.equal(await storage.hasOrphans(), false)
+})

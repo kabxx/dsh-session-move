@@ -27,7 +27,7 @@ function failure(code, message, cause) {
 }
 
 /** Resolve from the host, including an ASAR inside Electron and pnpm package layouts. */
-export function sessionRequire() {
+function sessionInstall() {
   const anchors = [process.env.DSH_INSTALL_DIR];
   if (process.versions.electron) {
     // The Desktop CLI can boot a profile in Electron without exporting DSH_INSTALL_DIR.
@@ -56,12 +56,21 @@ export function sessionRequire() {
       }
       const manifest = hostRequire.resolve(jsonlManifest);
       if (hostRequire(manifest).version !== '0.2.2-rc.5') throw new Error('Unexpected DSH session lease version');
-      return createRequire(manifest);
+      return { directory, manifest };
     } catch (error) {
       cause = error;
     }
   }
   throw failure('unsupported', 'Cannot locate the shipped DSH session lock implementation', cause);
+}
+
+/** The worker has a different argv[1]; pass it the installation we already validated. */
+export function sessionInstallDirectory() {
+  return sessionInstall().directory;
+}
+
+export function sessionRequire() {
+  return createRequire(sessionInstall().manifest);
 }
 
 function windowsApi() {
